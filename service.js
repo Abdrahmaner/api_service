@@ -1,7 +1,7 @@
 require("dotenv").config();
 const express = require("express");
 const nodemailer = require("nodemailer");
-const { Client, Pool } = require("pg"); // Changed from mysql2 to pg
+const { Pool } = require("pg");
 const cors = require("cors");
 const bodyParser = require("body-parser");
 const jwt = require("jsonwebtoken");
@@ -13,12 +13,10 @@ app.use(bodyParser.json());
 // PostgreSQL/CockroachDB Connection
 const db_url = process.env.DATABASE_URL || "postgresql://jeerpo:Ii-u7-0rPfJTLOCsKHGMwg@touchy-ragdoll-5519.jxf.gcp-europe-west3.cockroachlabs.cloud:26257/flutters?sslmode=verify-full";
 
-// Using a pool for better connection management
 const pool = new Pool({
   connectionString: db_url,
 });
 
-// Email transporter
 const transporter = nodemailer.createTransport({
   service: "gmail",
   auth: {
@@ -27,7 +25,6 @@ const transporter = nodemailer.createTransport({
   },
 });
 
-// Test database connection
 pool.connect((err, client, done) => {
   if (err) {
     console.error("Database connection failed:", err);
@@ -48,7 +45,6 @@ app.post("/authentication/local/sign-in", async (req, res) => {
     );
     
     if (result.rows.length > 0) {
-      // Create JWT token
       const token = jwt.sign({ userId: result.rows[0]._id }, secretKey, {
         expiresIn: "1h",
       });
@@ -72,7 +68,6 @@ app.post("/authentication/local/sign-up", async (req, res) => {
   }
 
   try {
-    // Check if user exists
     const userCheck = await pool.query(
       "SELECT * FROM users WHERE email = $1",
       [email]
@@ -82,7 +77,6 @@ app.post("/authentication/local/sign-up", async (req, res) => {
       return res.status(400).json({ error: "User already exists" });
     }
 
-    // Insert new user
     const result = await pool.query(
       "INSERT INTO users (email, password, firstName, lastName, phoneNumber) VALUES ($1, $2, $3, $4, $5) RETURNING _id",
       [email, password, firstName, lastName, phoneNumber]
@@ -106,7 +100,7 @@ app.post("/authentication/local/sign-up", async (req, res) => {
   }
 });
 
-// Get Products
+// Get Products - Fixed type comparison issues
 app.get("/products", async (req, res) => {
   const page = parseInt(req.query._page) || 1;
   const limit = parseInt(req.query._limit) || 10;
@@ -116,33 +110,39 @@ app.get("/products", async (req, res) => {
   let params = [];
   let paramIndex = 1;
 
-  // Handle filters
+  // 1. Handle keyword filter (always string)
   if (req.query.keyword) {
     conditions.push(`p.name ILIKE $${paramIndex}`);
     params.push(`%${req.query.keyword}%`);
     paramIndex++;
   }
+
+  // 2. Handle category_id (explicit as string)
   if (req.query.category_id) {
-    conditions.push(`p.category_id = $${paramIndex}`);
-    params.push(req.query.category_id);
+    conditions.push(`p.category_id = $${paramIndex}::text`);
+    params.push(String(req.query.category_id));
     paramIndex++;
   }
+
+  // 3. Handle numeric price filters
   if (req.query.min_price) {
-    conditions.push(`p.price >= $${paramIndex}`);
-    params.push(req.query.min_price);
+    conditions.push(`p.price >= $${paramIndex}::numeric`);
+    params.push(parseFloat(req.query.min_price));
     paramIndex++;
   }
   if (req.query.max_price) {
-    conditions.push(`p.price <= $${paramIndex}`);
-    params.push(req.query.max_price);
+    conditions.push(`p.price <= $${paramIndex}::numeric`);
+    params.push(parseFloat(req.query.max_price));
     paramIndex++;
   }
 
-  // Build the query dynamically based on filters
   let whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
+  // Debug: Log the query and parameters
+  console.log("Building query with:", { conditions, params });
+
   try {
-    // In PostgreSQL, use json_agg and json_build_object instead of JSON_ARRAYAGG and JSON_OBJECT
+    // Main query with explicit type handling in JOINs
     const query = `
       SELECT
         p._id AS _id,
@@ -151,29 +151,29 @@ app.get("/products", async (req, res) => {
         COALESCE(
           (SELECT json_agg(
             json_build_object(
-              '_id', pt._id,
+              '_id', pt._id::text,  -- Ensure text type
               'name', pt.name,
-              'price', pt.price
+              'price', pt.price::numeric
             )
           )
           FROM price_tags pt
-          WHERE pt.product_id = p._id
+          WHERE pt.product_id = p._id::text  -- Match types
           ), '[]'::json) AS priceTags,
         COALESCE(
           (SELECT json_agg(image_url)
-           FROM product_images pi
-           WHERE pi.product_id = p._id
+          FROM product_images pi
+          WHERE pi.product_id = p._id::text  -- Match types
           ), '[]'::json) AS images,
         COALESCE(
           (SELECT json_agg(
             json_build_object(
-              '_id', c._id,
+              '_id', c._id::text,  -- Ensure text type
               'name', c.name,
               'image', c.image
             )
           )
           FROM categories c
-          WHERE c._id = p.category_id
+          WHERE c._id = p.category_id::text  -- Match types
           ), '[]'::json) AS categories,
         p.createdAt,
         p.updatedAt
@@ -182,36 +182,42 @@ app.get("/products", async (req, res) => {
       LIMIT $${paramIndex} OFFSET $${paramIndex + 1};
     `;
 
+    console.log("Executing query:", query);
+    console.log("Parameters:", [...params, limit, offset]);
+
     const results = await pool.query(query, [...params, limit, offset]);
     
-    // Get total count
+    // Count query
     const countQuery = `SELECT COUNT(*) AS total FROM products p ${whereClause}`;
-    const countResult = await pool.query(countQuery, [...params]);
+    const countResult = await pool.query(countQuery, params);
     const total = parseInt(countResult.rows[0].total);
 
     res.json({
       meta: {
-        page: page,
+        page,
         pageSize: results.rows.length,
-        total: total,
+        total
       },
-      data: results.rows.map((product) => ({
-        _id: product._id,
-        name: product.name,
-        description: product.description,
-        priceTags: product.pricetags,
-        images: product.images,
-        categories: product.categories,
-        createdAt: product.createdat,
-        updatedAt: product.updatedat,
-      })),
+      data: results.rows
     });
   } catch (err) {
-    console.error("Database error:", err);
-    res.status(500).json({ error: "Database error" });
+    console.error("Full error details:", {
+      message: err.message,
+      stack: err.stack,
+      query: err.query,
+      parameters: err.parameters,
+      hint: "Check all JOIN conditions and WHERE clauses for type mismatches"
+    });
+    
+    res.status(500).json({
+      error: "Database operation failed",
+      details: err.message,
+      suggestion: "Verify that all IDs being compared are of the same type (text/text or uuid/uuid)"
+    });
   }
 });
 
+// Get Carts
 app.get("/carts", async (req, res) => {
   try {
     const query = `
@@ -241,11 +247,7 @@ app.get("/carts", async (req, res) => {
     `;
     
     const results = await pool.query(query);
-    
-    // Transform the results into the desired structure
     const transformedResults = transformResults(results.rows);
-
-    // Return the transformed results directly as an array
     res.json(transformedResults);
   } catch (err) {
     console.error("Database error:", err);
@@ -260,7 +262,6 @@ function transformResults(results) {
   results.forEach((row) => {
     const cartId = row.cart_id;
 
-    // Initialize the cart object if it doesn't exist
     if (!cartMap.has(cartId)) {
       cartMap.set(cartId, {
         _id: cartId,
@@ -285,7 +286,6 @@ function transformResults(results) {
 
     const cart = cartMap.get(cartId);
 
-    // Add price tag if it doesn't already exist
     const priceTagExists = cart.product.priceTags.some(
       (tag) => tag._id === row.price_tag_id
     );
@@ -297,7 +297,6 @@ function transformResults(results) {
       });
     }
 
-    // Add category if it doesn't already exist
     const categoryExists = cart.product.categories.some(
       (cat) => cat._id === row.category_id
     );
@@ -309,14 +308,12 @@ function transformResults(results) {
       });
     }
 
-    // Add image if it doesn't already exist
     const imageExists = cart.product.images.includes(row.product_image);
     if (!imageExists) {
       cart.product.images.push(row.product_image);
     }
   });
 
-  // Convert the map to an array of cart objects
   return Array.from(cartMap.values());
 }
 
@@ -342,7 +339,6 @@ app.post("/cart/add", async (req, res) => {
       return res.status(400).json({ message: "Missing required fields" });
     }
 
-    // PostgreSQL query
     await pool.query(
       "INSERT INTO cart_items (user_id, product_id, price_tag_id, quantity, created_at, updated_at) VALUES ($1, $2, $3, $4, NOW(), NOW())",
       [user_id, product_id, price_tag_id, quantity]
@@ -386,21 +382,16 @@ app.post("/carts/sync", async (req, res) => {
   }
 
   try {
-    // Verify token and get user ID
     const decoded = jwt.verify(token, secretKey);
     const userId = decoded.userId;
 
-    // Start a transaction
     const client = await pool.connect();
     
     try {
       await client.query('BEGIN');
       
-      // Clear existing cart items
       await client.query("DELETE FROM cart_items WHERE user_id = $1", [userId]);
       
-      // Insert new cart items - PostgreSQL doesn't support multi-row INSERT like MySQL
-      // So we need to loop through the items and insert them one by one
       for (const item of data) {
         await client.query(`
           INSERT INTO cart_items (user_id, product_id, price_tag_id, quantity, "createdAt", "updatedAt")
@@ -409,11 +400,10 @@ app.post("/carts/sync", async (req, res) => {
           userId,
           item.product_id,
           item.price_tag_id,
-          1, // Default quantity
+          1,
         ]);
       }
       
-      // Fetch updated cart items
       const result = await client.query(
         "SELECT * FROM cart_items WHERE user_id = $1",
         [userId]
